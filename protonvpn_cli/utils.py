@@ -337,19 +337,24 @@ def create_openvpn_config(serverlist, protocol, ports, proxy_only=False):
 
 def change_file_owner(path):
     """Change the owner of specific files to the sudo user."""
-    uid = int(subprocess.run(["id", "-u", USER],
-                             stdout=subprocess.PIPE).stdout)
-    gid = int(subprocess.run(["id", "-u", USER],
-                             stdout=subprocess.PIPE).stdout)
+    if not os.path.exists(path):
+        return
+    try:
+        uid = int(subprocess.run(["id", "-u", USER],
+                                 stdout=subprocess.PIPE).stdout)
+        gid = int(subprocess.run(["id", "-u", USER],
+                                 stdout=subprocess.PIPE).stdout)
 
-    current_owner = subprocess.run(["id", "-nu", str(os.stat(path).st_uid)],
-                                   stdout=subprocess.PIPE).stdout
-    current_owner = current_owner.decode().rstrip("\n")
+        current_owner = subprocess.run(["id", "-nu", str(os.stat(path).st_uid)],
+                                       stdout=subprocess.PIPE).stdout
+        current_owner = current_owner.decode().rstrip("\n")
 
-    # Only change file owner if it wasn't owned by current running user.
-    if current_owner != USER:
-        os.chown(path, uid, gid)
-        logger.debug("Changed owner of {0} to {1}".format(path, USER))
+        # Only change file owner if it wasn't owned by current running user.
+        if current_owner != USER:
+            os.chown(path, uid, gid)
+            logger.debug("Changed owner of {0} to {1}".format(path, USER))
+    except Exception as e:
+        logger.debug("change_file_owner failed for {0}: {1}".format(path, e))
 
 
 def check_root():

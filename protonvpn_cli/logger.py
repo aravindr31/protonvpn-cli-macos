@@ -15,9 +15,17 @@ def get_logger():
     )
     LOGFILE = os.path.join(CONFIG_DIR, "pvpn-cli.log")
 
-    # TBD, maybe /var/log is the better option
-    if not os.path.isdir(CONFIG_DIR):
-        os.mkdir(CONFIG_DIR)
+    # Create log directory if possible
+    try:
+        if not os.path.isdir(CONFIG_DIR):
+            os.makedirs(CONFIG_DIR, exist_ok=True)
+        # Starts a new file at 3MB size limit
+        file_handler = RotatingFileHandler(LOGFILE, maxBytes=3145728,
+                                           backupCount=1)
+        file_handler.setFormatter(FORMATTER)
+        logger.addHandler(file_handler)
+    except (PermissionError, OSError):
+        pass
 
     logger = logging.getLogger("protonvpn-cli")
     logger.setLevel(logging.DEBUG)
@@ -27,12 +35,6 @@ def get_logger():
     # Only log to console when using PVPN_DEBUG=1
     if os.environ.get("PVPN_DEBUG", 0) == "1":
         logger.addHandler(console_handler)
-
-    # Starts a new file at 3MB size limit
-    file_handler = RotatingFileHandler(LOGFILE, maxBytes=3145728,
-                                       backupCount=1)
-    file_handler.setFormatter(FORMATTER)
-    logger.addHandler(file_handler)
 
     return logger
 
