@@ -24,11 +24,12 @@ from .utils import (
 )
 # Constants
 from .constants import (
-    CONFIG_DIR, OVPN_FILE, PASSFILE, CONFIG_FILE
+    CONFIG_DIR, OVPN_FILE, PASSFILE, CONFIG_FILE,
+    PROXY_PID_FILE, PROXY_LOG_FILE
 )
 
 
-def dialog():
+def dialog(proxy_only=False):
     """Connect to a server with a dialog menu."""
     def show_dialog(headline, choices, stop=False):
         """Show the dialog and process response."""
@@ -122,10 +123,10 @@ def dialog():
     logger.debug("Protocol Choice: {0}".format(protocol_result))
 
     os.system("clear")
-    openvpn_connect(server_result, protocol_result)
+    openvpn_connect(server_result, protocol_result, proxy_only=proxy_only)
 
 
-def random_c(protocol=None):
+def random_c(protocol=None, proxy_only=False):
     """Connect to a random ProtonVPN Server."""
 
     logger.debug("Starting random connect")
@@ -137,10 +138,10 @@ def random_c(protocol=None):
 
     servername = random.choice(servers)["Name"]
 
-    openvpn_connect(servername, protocol)
+    openvpn_connect(servername, protocol, proxy_only=proxy_only)
 
 
-def fastest(protocol=None):
+def fastest(protocol=None, proxy_only=False):
     """Connect to the fastest server available."""
 
     logger.debug("Starting fastest connect")
@@ -163,10 +164,10 @@ def fastest(protocol=None):
             server_pool.append(server)
 
     fastest_server = get_fastest_server(server_pool)
-    openvpn_connect(fastest_server, protocol)
+    openvpn_connect(fastest_server, protocol, proxy_only=proxy_only)
 
 
-def country_f(country_code, protocol=None):
+def country_f(country_code, protocol=None, proxy_only=False):
     """Connect to the fastest server in a specific country."""
     logger.debug("Starting fastest country connect")
 
@@ -198,10 +199,10 @@ def country_f(country_code, protocol=None):
         sys.exit(1)
 
     fastest_server = get_fastest_server(server_pool)
-    openvpn_connect(fastest_server, protocol)
+    openvpn_connect(fastest_server, protocol, proxy_only=proxy_only)
 
 
-def feature_f(feature, protocol=None):
+def feature_f(feature, protocol=None, proxy_only=False):
     """Connect to the fastest server in a specific country."""
     logger.debug(
         "Starting fastest feature connect with feature {0}".format(feature)
@@ -223,10 +224,10 @@ def feature_f(feature, protocol=None):
         sys.exit(1)
 
     fastest_server = get_fastest_server(server_pool)
-    openvpn_connect(fastest_server, protocol)
+    openvpn_connect(fastest_server, protocol, proxy_only=proxy_only)
 
 
-def direct(user_input, protocol=None):
+def direct(user_input, protocol=None, proxy_only=False):
     """Connect to a single given server directly"""
 
     logger.debug("Starting direct connect with {0}".format(user_input))
@@ -280,7 +281,7 @@ def direct(user_input, protocol=None):
         logger.debug("{0} doesn't exist".format(servername))
         sys.exit(1)
 
-    openvpn_connect(servername, protocol)
+    openvpn_connect(servername, protocol, proxy_only=proxy_only)
 
 
 def reconnect():
@@ -299,7 +300,12 @@ def reconnect():
         )
         sys.exit(1)
 
-    openvpn_connect(servername, protocol)
+    try:
+        proxy_only = get_config_value("metadata", "proxy_only") == "1"
+    except KeyError:
+        proxy_only = False
+
+    openvpn_connect(servername, protocol, proxy_only=proxy_only)
 
 
 def disconnect(passed=False):
@@ -337,6 +343,11 @@ def disconnect(passed=False):
             manage_ipv6("restore")
             manage_killswitch("restore")
             manage_split_tunnel("remove")
+            stop_app_proxy()
+            try:
+                set_config_value("metadata", "proxy_only", "0")
+            except Exception:
+                pass
             logger.debug("Disconnected")
             if not passed:
                 print("Disconnected.")
@@ -347,6 +358,11 @@ def disconnect(passed=False):
         manage_ipv6("restore")
         manage_killswitch("restore")
         manage_split_tunnel("remove")
+        stop_app_proxy()
+        try:
+            set_config_value("metadata", "proxy_only", "0")
+        except Exception:
+            pass
         logger.debug("No connection found")
 
 
@@ -419,6 +435,33 @@ def status():
     connection_time = str(datetime.timedelta(
         seconds=connection_time)).split(".")[0]
 
+    try:
+        is_proxy_mode = get_config_value("metadata", "proxy_only") == "1"
+    except KeyError:
+        is_proxy_mode = False
+
+    if is_proxy_mode or is_app_proxy_running():
+        try:
+            vpn_iface = get_config_value("metadata", "vpn_interface")
+        except KeyError:
+            vpn_iface = "proton0"
+
+        logger.debug("Printing status (proxy mode)")
+        print(
+            "Status:       Connected (App Proxy Mode)\n"
+            + "Proxy:        127.0.0.1:1080 (SOCKS5)\n"
+            + "Interface:    {0}\n".format(vpn_iface)
+            + "Time:         {0}\n".format(connection_time)
+            + "System IP:    {0} ({1})\n".format(ip, isp)
+            + "Server:       {0}\n".format(connected_server)
+            + "Country:      {0} ({1})\n".format(country, city)
+            + "Features:     {0}\n".format(all_features[feature])
+            + "Protocol:     {0}\n".format(connected_protocol.upper())
+            + "Kill Switch:  Disabled (Bypassed for App Proxy)\n"
+            + "Firefox setup: SOCKS5 127.0.0.1:1080 (Proxy DNS enabled)"
+        )
+        return
+
     tx_amount, rx_amount = get_transferred_data()
 
     # Print Status Output
@@ -439,10 +482,64 @@ def status():
     )
 
 
-def openvpn_connect(servername, protocol):
+def start_app_proxy(iface_name, dns_server=None, port=1080):
+    """Start the SOCKS5 proxy daemon bound to the VPN interface."""
+    stop_app_proxy()
+    cmd = [
+        sys.executable, "-m", "protonvpn_cli.socks5_proxy",
+        iface_name, str(dns_server) if dns_server else "None",
+        str(port), PROXY_LOG_FILE
+    ]
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True
+    )
+    with open(PROXY_PID_FILE, "w") as f:
+        f.write(str(proc.pid))
+    logger.debug("Started SOCKS5 proxy daemon with PID {0} on port {1}".format(proc.pid, port))
+    return proc.pid
+
+
+def stop_app_proxy():
+    """Stop the SOCKS5 proxy daemon if running."""
+    if os.path.isfile(PROXY_PID_FILE):
+        try:
+            with open(PROXY_PID_FILE, "r") as f:
+                pid = int(f.read().strip())
+            os.kill(pid, 15)
+            time.sleep(0.2)
+            try:
+                os.kill(pid, 0)
+                os.kill(pid, 9)
+            except OSError:
+                pass
+        except Exception as e:
+            logger.debug("Error stopping proxy PID: {0}".format(e))
+        finally:
+            if os.path.isfile(PROXY_PID_FILE):
+                os.remove(PROXY_PID_FILE)
+    subprocess.run(["pkill", "-f", "protonvpn_cli.socks5_proxy"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def is_app_proxy_running():
+    """Return True if SOCKS5 proxy process is active."""
+    if not os.path.isfile(PROXY_PID_FILE):
+        return False
+    try:
+        with open(PROXY_PID_FILE, "r") as f:
+            pid = int(f.read().strip())
+        os.kill(pid, 0)
+        return True
+    except Exception:
+        return False
+
+
+def openvpn_connect(servername, protocol, proxy_only=False):
     """Connect to VPN Server."""
 
-    logger.debug("Initiating OpenVPN connection")
+    logger.debug("Initiating OpenVPN connection (proxy_only={0})".format(proxy_only))
     logger.debug(
         "Connecting to {0} via {1}".format(servername, protocol.upper())
     )
@@ -453,8 +550,8 @@ def openvpn_connect(servername, protocol):
     subservers = get_server_value(servername, "Servers", servers)
     ip_list = [subserver["EntryIP"] for subserver in subservers]
 
-    # Ports gets casted to a list instead of just a single port to make it iterable
-    create_openvpn_config(serverlist=ip_list, protocol=protocol, ports=[port[protocol.lower()]])
+    # Create OpenVPN config with proxy_only setting
+    create_openvpn_config(serverlist=ip_list, protocol=protocol, ports=[port[protocol.lower()]], proxy_only=proxy_only)
 
     disconnect(passed=True)
 
@@ -469,7 +566,8 @@ def openvpn_connect(servername, protocol):
 
     old_ip, _ = get_ip_info()
 
-    print("Connecting to {0} via {1}...".format(servername, protocol.upper()))
+    mode_str = " (App Proxy Mode)" if proxy_only else ""
+    print("Connecting to {0} via {1}{2}...".format(servername, protocol.upper(), mode_str))
 
     patch_passfile(PASSFILE)
 
@@ -494,40 +592,69 @@ def openvpn_connect(servername, protocol):
             f.seek(0)
             # If connection successful
             if "Initialization Sequence Completed" in content:
-                # Enable DNS Leak Protection
                 dns_dhcp_regex = re.compile(
                     r"(dhcp-option DNS )"
                     r"(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})"
                 )
 
                 dns_dhcp = dns_dhcp_regex.search(content)
-                if dns_dhcp:
-                    dns_server = dns_dhcp.group(2)
+                dns_server = dns_dhcp.group(2) if dns_dhcp else None
+                if dns_server:
                     set_config_value("metadata", "dns_server", dns_server)
-                    manage_dns("leak_protection", dns_server)
-                else:
-                    print(
-                        "[!] Could not enable DNS Leak Protection!\n"
-                        "[!] Make sure you are protected!"
-                    )
-                manage_ipv6("disable")
-                manage_killswitch("enable", proto=protocol.lower(),
-                                  port=port[protocol.lower()])
 
-                # Apply split tunneling routes via the pre-VPN gateway
-                if pre_vpn_gateway:
-                    manage_split_tunnel("apply", gateway=pre_vpn_gateway)
-                else:
-                    logger.debug("Skipping split tunnel: no pre-VPN gateway")
+                if proxy_only:
+                    # In App Proxy mode: do NOT change system DNS or firewall.
+                    # Find tunnel interface from log
+                    vpn_dev_match = re.search(r"(?:TUN\/TAP device|Opened utun device|ifconfig\s+)(utun\d+|proton0)", content)
+                    vpn_dev = vpn_dev_match.group(1) if vpn_dev_match else "proton0"
 
-                new_ip, _ = get_ip_info()
-                if old_ip == new_ip:
-                    logger.debug("Failed to connect. IP didn't change")
-                    print("[!] Connection failed. Reverting all changes...")
-                    disconnect(passed=True)
-                print("Connected!")
-                logger.debug("Connection successful")
-                break
+                    start_app_proxy(vpn_dev, dns_server=dns_server, port=1080)
+                    set_config_value("metadata", "proxy_only", "1")
+                    set_config_value("metadata", "vpn_interface", vpn_dev)
+
+                    print()
+                    print("[✓] Connected to ProtonVPN in App Proxy mode!")
+                    print("[✓] System internet traffic remains UNTOUCHED on your regular Wi-Fi/LAN.")
+                    print("[✓] Local SOCKS5 proxy is active on 127.0.0.1:1080 (tunnel interface: {0}).".format(vpn_dev))
+                    print()
+                    print("To route Firefox (and Firefox only) through this VPN:")
+                    print("  1. In Firefox, open Settings -> General -> Network Settings -> Settings...")
+                    print("  2. Select 'Manual proxy configuration'")
+                    print("  3. SOCKS Host: 127.0.0.1   Port: 1080   (Select SOCKS v5)")
+                    print("  4. Check 'Proxy DNS when using SOCKS v5' (prevents DNS leaks)")
+                    print("  5. Click OK")
+                    print()
+                    print("All Firefox tabs now route through ProtonVPN; all other apps use normal internet.")
+                    logger.debug("App Proxy connected successfully")
+                    break
+                else:
+                    set_config_value("metadata", "proxy_only", "0")
+                    # Enable DNS Leak Protection
+                    if dns_server:
+                        manage_dns("leak_protection", dns_server)
+                    else:
+                        print(
+                            "[!] Could not enable DNS Leak Protection!\n"
+                            "[!] Make sure you are protected!"
+                        )
+                    manage_ipv6("disable")
+                    manage_killswitch("enable", proto=protocol.lower(),
+                                      port=port[protocol.lower()])
+
+                    # Apply split tunneling routes via the pre-VPN gateway
+                    if pre_vpn_gateway:
+                        manage_split_tunnel("apply", gateway=pre_vpn_gateway)
+                    else:
+                        logger.debug("Skipping split tunnel: no pre-VPN gateway")
+
+                    new_ip, _ = get_ip_info()
+                    if old_ip == new_ip:
+                        logger.debug("Failed to connect. IP didn't change")
+                        print("[!] Connection failed. Reverting all changes...")
+                        disconnect(passed=True)
+                    print("Connected!")
+                    logger.debug("Connection successful")
+                    break
             # If Authentication failed
             elif "AUTH_FAILED" in content:
                 print(

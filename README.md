@@ -77,6 +77,8 @@ sudo python3 setup.py install
 |`protonvpn reconnect, r`           | Reconnect or connect to the last server used.         |
 |`protonvpn disconnect, d`          | Disconnect the current session.                       |
 |`protonvpn status, s`              | Print connection status.                              |
+|`protonvpn c -f --proxy-only`      | Connect in App Proxy mode (routes only apps configured for SOCKS5 127.0.0.1:1080). |
+|`protonvpn app-routing`            | Print step-by-step guide for routing Firefox through ProtonVPN. |
 |`protonvpn split-tunnel list`      | List IPs/CIDRs excluded from VPN (bypass routes).     |
 |`protonvpn split-tunnel add <ip>`  | Add an IP/CIDR to bypass the VPN.                     |
 |`protonvpn split-tunnel remove <ip>`| Remove an IP/CIDR from the bypass list.              |

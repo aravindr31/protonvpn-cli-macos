@@ -281,12 +281,13 @@ def render_j2_template(template_file, destination_file, values):
     change_file_owner(destination_file)
 
 
-def create_openvpn_config(serverlist, protocol, ports):
+def create_openvpn_config(serverlist, protocol, ports, proxy_only=False):
     """
     Create the OpenVPN Config file
     serverlist = list with IPs or hostnames
     protocol = "udp" or "tcp"
     ports = list with possible ports
+    proxy_only = boolean, if True do not redirect default gateway
     """
 
     # Split Tunneling
@@ -327,7 +328,8 @@ def create_openvpn_config(serverlist, protocol, ports):
         "openvpn_ports": ports,
         "split": split,
         "ip_nm_pairs": ip_nm_pairs,
-        "ipv6_disabled": ipv6_disabled
+        "ipv6_disabled": ipv6_disabled,
+        "proxy_only": proxy_only
     }
 
     render_j2_template(template_file="openvpn_template.j2", destination_file=OVPN_FILE, values=j2_values)

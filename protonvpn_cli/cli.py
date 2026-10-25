@@ -3,19 +3,20 @@ A CLI for ProtonVPN.
 
 Usage:
     protonvpn init
-    protonvpn (c | connect) [<servername>] [-p <protocol>]
-    protonvpn (c | connect) [-f | --fastest] [-p <protocol>]
-    protonvpn (c | connect) [--cc <code>] [-p <protocol>]
-    protonvpn (c | connect) [--sc] [-p <protocol>]
-    protonvpn (c | connect) [--p2p] [-p <protocol>]
-    protonvpn (c | connect) [--tor] [-p <protocol>]
-    protonvpn (c | connect) [-r | --random] [-p <protocol>]
+    protonvpn (c | connect) [<servername>] [-p <protocol>] [--proxy-only]
+    protonvpn (c | connect) [-f | --fastest] [-p <protocol>] [--proxy-only]
+    protonvpn (c | connect) [--cc <code>] [-p <protocol>] [--proxy-only]
+    protonvpn (c | connect) [--sc] [-p <protocol>] [--proxy-only]
+    protonvpn (c | connect) [--p2p] [-p <protocol>] [--proxy-only]
+    protonvpn (c | connect) [--tor] [-p <protocol>] [--proxy-only]
+    protonvpn (c | connect) [-r | --random] [-p <protocol>] [--proxy-only]
     protonvpn (r | reconnect)
     protonvpn (d | disconnect)
     protonvpn (s | status)
     protonvpn configure
     protonvpn refresh
     protonvpn examples
+    protonvpn app-routing
     protonvpn split-tunnel list
     protonvpn split-tunnel add <ip>
     protonvpn split-tunnel remove <ip>
@@ -31,6 +32,9 @@ Options:
     --p2p               Connect to the fastest torrent server.
     --tor               Connect to the fastest Tor server.
     -p PROTOCOL         Determine the protocol (UDP or TCP).
+    --proxy-only        App Proxy mode: start SOCKS5 proxy on 127.0.0.1:1080
+                        and route only configured apps (e.g. Firefox),
+                        leaving normal system network traffic untouched.
     -h, --help          Show this help message.
     -v, --version       Display version.
 
@@ -43,6 +47,7 @@ Commands:
     configure           Change ProtonVPN-CLI configuration.
     refresh             Refresh OpenVPN configuration and server data.
     examples            Print some example commands.
+    app-routing         Print guide on routing Firefox through the VPN.
     split-tunnel        Manage split tunneling rules.
       list              Show all IPs/CIDRs excluded from VPN.
       add <ip>          Add an IP or CIDR to exclude from VPN.
@@ -117,27 +122,28 @@ def cli():
         if int(os.environ.get("PVPN_WAIT", 0)) > 0:
             wait_for_network(int(os.environ["PVPN_WAIT"]))
 
+        proxy_only = bool(args.get("--proxy-only"))
         protocol = args.get("-p")
         if protocol is not None and protocol.lower().strip() in ["tcp", "udp"]:
             protocol = protocol.lower().strip()
 
         if args.get("--random"):
-            connection.random_c(protocol)
+            connection.random_c(protocol, proxy_only=proxy_only)
         elif args.get("--fastest"):
-            connection.fastest(protocol)
+            connection.fastest(protocol, proxy_only=proxy_only)
         elif args.get("<servername>"):
-            connection.direct(args.get("<servername>"), protocol)
+            connection.direct(args.get("<servername>"), protocol, proxy_only=proxy_only)
         elif args.get("--cc") is not None:
-            connection.country_f(args.get("--cc"), protocol)
+            connection.country_f(args.get("--cc"), protocol, proxy_only=proxy_only)
         # Features: 1: Secure-Core, 2: Tor, 4: P2P
         elif args.get("--p2p"):
-            connection.feature_f(4, protocol)
+            connection.feature_f(4, protocol, proxy_only=proxy_only)
         elif args.get("--sc"):
-            connection.feature_f(1, protocol)
+            connection.feature_f(1, protocol, proxy_only=proxy_only)
         elif args.get("--tor"):
-            connection.feature_f(2, protocol)
+            connection.feature_f(2, protocol, proxy_only=proxy_only)
         else:
-            connection.dialog()
+            connection.dialog(proxy_only=proxy_only)
     elif args.get("r") or args.get("reconnect"):
         check_root()
         check_init()
@@ -157,6 +163,8 @@ def cli():
         pull_server_data(force=True)
     elif args.get("examples"):
         print_examples()
+    elif args.get("app-routing"):
+        print_app_routing_guide()
     elif args.get("split-tunnel"):
         check_root()
         check_init()
@@ -853,3 +861,46 @@ def split_tunnel_clear():
 
     set_config_value("USER", "split_tunnel", 0)
     print("Split tunnel list cleared and split tunneling disabled.")
+
+
+def print_app_routing_guide():
+    """Print guide on routing Firefox or other apps through the VPN proxy."""
+    guide = (
+        "\n"
+        "======================================================================\n"
+        "           HOW TO ROUTE FIREFOX (ONLY) THROUGH PROTONVPN              \n"
+        "======================================================================\n"
+        "\n"
+        "In App Proxy mode, your Mac's default network route is UNTOUCHED.\n"
+        "All your normal applications (Safari, Zoom, Slack, Terminal, etc.)\n"
+        "continue using your normal Wi-Fi / home network.\n"
+        "\n"
+        "Only the applications you configure for SOCKS5 proxy will route\n"
+        "their traffic and DNS through ProtonVPN.\n"
+        "\n"
+        "--- STEP 1: Connect in App Proxy mode ---\n"
+        "  sudo protonvpn c -f --proxy-only\n"
+        "\n"
+        "--- STEP 2: Configure Firefox ---\n"
+        "  1. Open Firefox.\n"
+        "  2. Press Cmd + , (or go to Settings / Preferences).\n"
+        "  3. In the search box, type 'network' or scroll to 'Network Settings'.\n"
+        "  4. Click the 'Settings...' button.\n"
+        "  5. Choose 'Manual proxy configuration':\n"
+        "       SOCKS Host: 127.0.0.1\n"
+        "       Port:       1080\n"
+        "       Version:    Select 'SOCKS v5'\n"
+        "  6. [CRITICAL] Check the box:\n"
+        "       ☑ 'Proxy DNS when using SOCKS v5'\n"
+        "       (This forces all domain lookups through ProtonVPN to prevent DNS leaks)\n"
+        "  7. Click 'OK'.\n"
+        "\n"
+        "--- STEP 3: Verify ---\n"
+        "  Visit https://ipinfo.io in Firefox -> Shows ProtonVPN's IP and ISP.\n"
+        "  Visit https://ipinfo.io in Safari  -> Shows your normal home IP and ISP.\n"
+        "\n"
+        "--- STEP 4: Disconnect when done ---\n"
+        "  sudo protonvpn disconnect\n"
+        "======================================================================\n"
+    )
+    print(guide)

@@ -61,6 +61,12 @@ pull-filter ignore "ifconfig-ipv6"
 pull-filter ignore "route-ipv6"
 {%- endif %}
 
+{%- if proxy_only %}
+
+# App Proxy Mode: do not redirect system default gateway
+route-nopull
+{%- endif %}
+
 {%- if split %}
 
 # Split Tunneling
