@@ -5,12 +5,23 @@
 
 <h3 align="center">An [unofficial] MacOS CLI for ProtonVPN. Written in Python.</h3>
 
-## Important information
-Killswitch functionality is not available for MacOS because it uses `iptables` and such.  This repo simply includes a slight rewrite of the `utils.py` script that will grab the default interface via `netstat` instead of requiring `iproute2` as a dependency.
+## macOS Compatibility
+
+This fork adapts the ProtonVPN Linux CLI to work natively on macOS by replacing
+all Linux-specific subsystems with macOS equivalents:
+
+| Feature | Linux original | macOS replacement |
+|---|---|---|
+| Default NIC detection | `ip route` / `iproute2` | `netstat -rn -f inet` |
+| DNS leak protection | `/etc/resolv.conf` | `networksetup -setdnsservers` |
+| IPv6 disable/restore | `ip6tables` | `networksetup -setv6off/automatic` |
+| Kill Switch | `iptables` | `pf` (Packet Filter) via `pfctl` |
+| Transfer stats | `/sys/class/net/*/statistics` | `netstat -I <iface> -b` |
+| IPv6 detection | `/proc/sys/net/ipv6` | `ifconfig <iface>` |
+
+> **Note:** Kill Switch requires `sudo pfctl` access and is enabled/disabled alongside the VPN connection automatically.
 
 ## Installation & Updating
-
-For more detailed information on installing, updating and uninstalling, please view the extensive [usage guide](https://github.com/ProtonVPN/linux-cli/blob/master/USAGE.md#installation--updating).
 
 #### Installing Dependencies
 
@@ -19,14 +30,11 @@ For more detailed information on installing, updating and uninstalling, please v
 - homebrew
 - openvpn
 - dialog (optional, needed for interactive selection)
-- python3.5+
+- python3.8+
 
-Depending on your distribution, run the appropriate following command to install the necessary dependencies
-
-| **Distro**                              | **Command**                                                        |
-|:----------------------------------------|:------------------------------------------------                   |
-|MacOS                       | `brew install openvpn dialog python3`       |
-
+```bash
+brew install openvpn dialog python3
+```
 
 ### Manual Installation from source
 
@@ -40,12 +48,17 @@ Depending on your distribution, run the appropriate following command to install
 
 3. Install
 
-    ```
+    ```bash
     pip3 install -r requirements.txt
     sudo python3 setup.py install
     ```
 
-For updating, you just need to pull the latest version of the repository with git.
+For updating, pull the latest version:
+
+```bash
+git pull
+sudo python3 setup.py install
+```
 
 ### How to use
 

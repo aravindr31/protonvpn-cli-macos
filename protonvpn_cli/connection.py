@@ -361,7 +361,7 @@ def status():
     if not is_connected():
         logger.debug("Disconnected")
         print("Status:     Disconnected")
-        if os.path.isfile(os.path.join(CONFIG_DIR, "iptables.backup")):
+        if os.path.isfile(os.path.join(CONFIG_DIR, "pf_killswitch.backup")):
             print("[!] Kill Switch is currently active.")
             logger.debug("Kill Switch active while VPN disconnected")
         else:
@@ -407,7 +407,7 @@ def status():
     last_connection = get_config_value("metadata", "connected_time")
     connection_time = time.time() - int(last_connection)
 
-    if os.path.isfile(os.path.join(CONFIG_DIR, "iptables.backup")):
+    if os.path.isfile(os.path.join(CONFIG_DIR, "pf_killswitch.backup")):
         killswitch_on = True
     else:
         killswitch_on = False
@@ -542,22 +542,41 @@ def openvpn_connect(servername, protocol):
 
 def manage_dns(mode, dns_server=False):
     """
-    Manage resolv.conf to circumvent DNS Leaks.
+    Manage DNS to circumvent DNS Leaks on macOS.
 
+    Uses networksetup to set/restore DNS per network service.
     Has 2 modes (string): leak_protection / restore
-    leak_protection: Replace the current resolv.conf entries with ProtonVPN DNS
-    restore: Revert changes and restore original configuration
+      leak_protection: Set ProtonVPN DNS on the active network service.
+      restore: Revert DNS to DHCP-provided (empty list).
     """
 
-    backupfile = os.path.join(CONFIG_DIR, "resolv.conf.backup")
-    resolvconf_path = os.path.realpath("/etc/resolv.conf")
+    backupfile = os.path.join(CONFIG_DIR, "dns.backup")
+
+    def get_active_network_service():
+        """Return the macOS network service name that has the default route."""
+        default_nic = get_default_nic()
+        # Map device name → network service name via networksetup
+        result = subprocess.run(
+            ["networksetup", "-listnetworkserviceorder"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE
+        )
+        service = None
+        lines = result.stdout.decode().splitlines()
+        for i, line in enumerate(lines):
+            if "Device: {0})".format(default_nic) in line:
+                # Previous line is like "(1) Wi-Fi"
+                prev = lines[i - 1].strip()
+                service = re.sub(r"^\(\d+\)\s+", "", prev)
+                break
+        if not service:
+            # Fall back to scanning for a service whose device matches
+            logger.debug("Could not map NIC {0} to a service, using Wi-Fi".format(default_nic))
+            service = "Wi-Fi"
+        return service
 
     if mode == "leak_protection":
-        logger.debug("Leak Protection initiated")
-        # Restore original resolv.conf if it exists
-        if os.path.isfile(backupfile):
-            logger.debug("resolv.conf.backup exists")
-            manage_dns("restore")
+        logger.debug("DNS Leak Protection initiated (macOS)")
+
         # Check for custom DNS Server
         if not int(get_config_value("USER", "dns_leak_protection")):
             if get_config_value("USER", "custom_dns") == "None":
@@ -568,61 +587,79 @@ def manage_dns(mode, dns_server=False):
                 logger.debug("Using custom DNS")
         else:
             logger.debug("DNS Leak Protection is enabled")
-        # Make sure DNS Server has been provided
+
         if not dns_server:
             raise Exception("No DNS Server has been provided.")
 
-        shutil.copy2(resolvconf_path, backupfile)
-        logger.debug("{0} (resolv.conf) backed up".format(resolvconf_path))
+        service = get_active_network_service()
 
-        # Remove previous nameservers
-        dns_regex = re.compile(r"^nameserver .*$")
+        # Back up current DNS servers
+        current_dns = subprocess.run(
+            ["networksetup", "-getdnsservers", service],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE
+        )
+        current_dns_output = current_dns.stdout.decode().strip()
+        with open(backupfile, "w") as f:
+            f.write("{0}\n{1}\n".format(service, current_dns_output))
+        logger.debug("DNS backup written for service: {0}".format(service))
 
-        with open(backupfile, 'r') as backup_handle:
-            with open(resolvconf_path, 'w') as resolvconf_handle:
-                for line in backup_handle:
-                    if not dns_regex.search(line):
-                        resolvconf_handle.write(line)
+        # Set ProtonVPN DNS
+        dns_entries = dns_server.split()
+        subprocess.run(
+            ["networksetup", "-setdnsservers", service] + dns_entries,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE
+        )
+        logger.debug("Set DNS to {0} for {1}".format(dns_entries, service))
 
-        logger.debug("Removed existing DNS Servers")
+        # Flush DNS cache on macOS
+        subprocess.run(
+            ["dscacheutil", "-flushcache"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE
+        )
+        subprocess.run(
+            ["killall", "-HUP", "mDNSResponder"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE
+        )
 
-        # Add ProtonVPN managed DNS Server to resolv.conf
-        dns_server = dns_server.split()
-        with open(resolvconf_path, "a") as f:
-            f.write("# ProtonVPN DNS Servers. Managed by ProtonVPN-CLI.\n")
-            for dns in dns_server[:3]:
-                f.write("nameserver {0}\n".format(dns))
-            logger.debug("Added ProtonVPN or custom DNS")
-
-        # Write the hash of the edited file in the configuration
-        #
-        # This is so it doesn't restore an old DNS configuration
-        # if the configuration changes during a VPN session
-        # (e.g. by switching networks)
-
-        with open(resolvconf_path, "rb") as f:
+        # Store hash of current DNS state
+        with open(backupfile, "rb") as f:
             filehash = zlib.crc32(f.read())
         set_config_value("metadata", "resolvconf_hash", filehash)
 
     elif mode == "restore":
-        logger.debug("Restoring DNS")
+        logger.debug("Restoring DNS (macOS)")
         if os.path.isfile(backupfile):
+            with open(backupfile, "r") as f:
+                lines = f.readlines()
+            service = lines[0].strip()
+            # The rest of the lines are the old DNS servers (or the "no servers" message)
+            old_dns_lines = [l.strip() for l in lines[1:] if l.strip()]
 
-            # Check if the file changed since connection
-            oldhash = get_config_value("metadata", "resolvconf_hash")
-            with open(resolvconf_path, "rb") as f:
-                filehash = zlib.crc32(f.read())
-
-            if filehash == int(oldhash):
-                shutil.copy2(backupfile, resolvconf_path)
-                logger.debug("resolv.conf restored from backup")
+            # If the backup says "There aren't any DNS Servers set on <service>."
+            # that means DNS was set by DHCP — restore to empty (DHCP)
+            if not old_dns_lines or "aren't any" in " ".join(old_dns_lines):
+                subprocess.run(
+                    ["networksetup", "-setdnsservers", service, "empty"],
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE
+                )
+                logger.debug("Restored DNS to DHCP for {0}".format(service))
             else:
-                logger.debug("resolv.conf changed. Not restoring.")
+                subprocess.run(
+                    ["networksetup", "-setdnsservers", service] + old_dns_lines,
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE
+                )
+                logger.debug("Restored DNS to {0} for {1}".format(old_dns_lines, service))
+
+            # Flush DNS cache
+            subprocess.run(["dscacheutil", "-flushcache"],
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            subprocess.run(["killall", "-HUP", "mDNSResponder"],
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
             os.remove(backupfile)
-            logger.debug("resolv.conf.backup removed")
+            logger.debug("dns.backup removed")
         else:
-            logger.debug("No Backupfile found")
+            logger.debug("No DNS backup found")
     else:
         raise Exception("Invalid argument provided. "
                         "Mode must be 'restore' or 'leak_protection'")
@@ -630,133 +667,81 @@ def manage_dns(mode, dns_server=False):
 
 def manage_ipv6(mode):
     """
-    Disable and Enable IPv6 to circumvent IPv6 leaks.
+    Disable and Enable IPv6 to circumvent IPv6 leaks on macOS.
 
     Has 2 modes (string): disable / restore.
-    disable: Disables IPv6 for the default interface.
-    restore: Revert changes and restore original configuration.
+    disable: Disables IPv6 on the active network service.
+    restore: Re-enables IPv6 (sets back to Automatic).
     """
 
     ipv6_backupfile = os.path.join(CONFIG_DIR, "ipv6.backup")
-    ip6tables_backupfile = os.path.join(CONFIG_DIR, "ip6tables.backup")
+
+    def get_active_service_for_nic(nic):
+        """Map a NIC device name to its macOS network service name."""
+        result = subprocess.run(
+            ["networksetup", "-listnetworkserviceorder"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE
+        )
+        lines = result.stdout.decode().splitlines()
+        for i, line in enumerate(lines):
+            if "Device: {0})".format(nic) in line:
+                prev = lines[i - 1].strip()
+                service = re.sub(r"^\(\d+\)\s+", "", prev)
+                return service
+        return "Wi-Fi"
 
     if mode == "disable":
+        logger.debug("Disabling IPv6 (macOS)")
 
-        logger.debug("Disabling IPv6")
-        # Needs to be removed eventually. I'll leave it in for now
-        # so it still properly restores the IPv6 address the old way
         if os.path.isfile(ipv6_backupfile):
-            manage_ipv6("legacy_restore")
-
-        if os.path.isfile(ip6tables_backupfile):
-            logger.debug("IPv6 backup exists")
+            logger.debug("IPv6 backup exists, restoring first")
             manage_ipv6("restore")
 
         if is_ipv6_disabled():
-            logger.debug("IPv6 is disabled or unavailable, skipping leak protection")
+            logger.debug("IPv6 is disabled or unavailable, skipping")
             return
 
-        # Backing up ip6ables rules
-        logger.debug("Backing up ip6tables rules")
-        ip6tables_rules = subprocess.run(["ip6tables-save"],
-                                         stdout=subprocess.PIPE)
+        try:
+            default_nic = get_default_nic()
+        except RuntimeError:
+            logger.debug("Could not determine NIC for IPv6 disable")
+            return
 
-        if "COMMIT" in ip6tables_rules.stdout.decode():
-            with open(ip6tables_backupfile, "wb") as f:
-                f.write(ip6tables_rules.stdout)
-        else:
-            with open(ip6tables_backupfile, "w") as f:
-                f.write("*filter\n")
-                f.write(":INPUT ACCEPT\n")
-                f.write(":FORWARD ACCEPT\n")
-                f.write(":OUTPUT ACCEPT\n")
-                f.write("COMMIT\n")
+        service = get_active_service_for_nic(default_nic)
 
-        # Get the default nic from ip route show output
-        default_nic = get_default_nic()
+        # Check current IPv6 state before disabling
+        ipv6_state = subprocess.run(
+            ["networksetup", "-getinfo", service],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE
+        )
 
-        ip6tables_commands = [
-            "ip6tables -A INPUT -i {0} -j DROP".format(default_nic),
-            "ip6tables -A OUTPUT -o {0} -j DROP".format(default_nic),
-        ]
-        for command in ip6tables_commands:
-            command = command.split()
-            subprocess.run(command)
-        logger.debug("IPv6 disabled successfully")
+        with open(ipv6_backupfile, "w") as f:
+            f.write("{0}\n".format(service))
+        logger.debug("IPv6 backup written for service: {0}".format(service))
+
+        subprocess.run(
+            ["networksetup", "-setv6off", service],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE
+        )
+        logger.debug("IPv6 disabled for {0}".format(service))
 
     elif mode == "restore":
-        logger.debug("Restoring ip6tables")
-        # Same as above, remove eventually
-        if os.path.isfile(ipv6_backupfile):
-            logger.debug("legacy ipv6 backup found")
-            manage_ipv6("legacy_restore")
-        if os.path.isfile(ip6tables_backupfile):
-            subprocess.run(
-                "ip6tables-restore < {0}".format(
-                    ip6tables_backupfile
-                ), shell=True, stdout=subprocess.PIPE
-            )
-            logger.debug("ip6tables restored")
-            os.remove(ip6tables_backupfile)
-            logger.debug("ip6tables.backup removed")
-        else:
-            logger.debug("No Backupfile found")
-        return
-
-    elif mode == "legacy_restore":
-        logger.debug("Restoring IPv6")
+        logger.debug("Restoring IPv6 (macOS)")
         if not os.path.isfile(ipv6_backupfile):
-            logger.debug("No Backupfile found")
+            logger.debug("No IPv6 backup found")
             return
 
         with open(ipv6_backupfile, "r") as f:
-            lines = f.readlines()
-            default_nic = lines[0].strip()
-            ipv6_addr = lines[1].strip()
+            service = f.readline().strip()
 
-        ipv6_info = subprocess.run(
-            "ip addr show dev {0} | grep '\<inet6.*global\>'".format(default_nic), # noqa
-            shell=True, stderr=subprocess.PIPE, stdout=subprocess.PIPE
+        subprocess.run(
+            ["networksetup", "-setv6automatic", service],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE
         )
+        logger.debug("IPv6 restored to Automatic for {0}".format(service))
 
-        has_ipv6 = True if ipv6_info.returncode == 0 else False
-
-        if has_ipv6:
-            logger.debug("IPv6 address present")
-            os.remove(ipv6_backupfile)
-            return
-
-        ipv6_enable = subprocess.run(
-            "sysctl -w net.ipv6.conf.{0}.disable_ipv6=0".format(default_nic),
-            shell=True, stderr=subprocess.PIPE, stdout=subprocess.PIPE
-        )
-
-        if not ipv6_enable.returncode == 0:
-            print(
-                "[!] There was an error with restoring the IPv6 configuration"
-            )
-            logger.debug("IPv6 restoration error: sysctl")
-            logger.debug("stdout: {0}".format(ipv6_enable.stdout))
-            logger.debug("stderr: {0}".format(ipv6_enable.stderr))
-            return
-
-        ipv6_restore_address = subprocess.run(
-            "ip addr add {0} dev {1}".format(ipv6_addr, default_nic),
-            shell=True, stderr=subprocess.PIPE, stdout=subprocess.PIPE
-        )
-
-        if not ipv6_restore_address.returncode == 0:
-            print(
-                "[!] There was an error with restoring the IPv6 configuration"
-            )
-            logger.debug("IPv6 restoration error: ip")
-            logger.debug("stdout: {0}".format(ipv6_restore_address.stdout))
-            logger.debug("stderr: {0}".format(ipv6_restore_address.stderr))
-            return
-
-        logger.debug("Removing IPv6 backup file")
         os.remove(ipv6_backupfile)
-        logger.debug("IPv6 restored")
+        logger.debug("ipv6.backup removed")
 
     else:
         raise Exception("Invalid argument provided. "
@@ -765,98 +750,138 @@ def manage_ipv6(mode):
 
 def manage_killswitch(mode, proto=None, port=None):
     """
-    Disable and enable the VPN Kill Switch.
+    Disable and enable the VPN Kill Switch on macOS using pf (Packet Filter).
 
-    The Kill Switch creates IPTables rules that only allow connections to go
-    through the OpenVPN device. If the OpenVPN process stops for some unknown
-    reason this will completely block access to the internet.
+    The Kill Switch adds pf rules that only allow traffic through the VPN
+    tunnel interface. If OpenVPN stops unexpectedly, all internet traffic is
+    blocked, preventing leaks.
+
+    Modes:
+      enable  – Install pf kill switch anchor rules.
+      restore – Remove pf kill switch anchor rules.
     """
 
-    backupfile = os.path.join(CONFIG_DIR, "iptables.backup")
+    backupfile = os.path.join(CONFIG_DIR, "pf_killswitch.backup")
+    anchor_name = "protonvpn_killswitch"
 
     if mode == "restore":
-        logger.debug("Restoring iptables")
+        logger.debug("Restoring pf (removing kill switch)")
         if os.path.isfile(backupfile):
-            logger.debug("Restoring IPTables rules")
-            subprocess.run("iptables-restore < {0}".format(backupfile),
-                           shell=True, stdout=subprocess.PIPE)
-            logger.debug("iptables restored")
+            # Flush our anchor
+            subprocess.run(
+                ["pfctl", "-a", anchor_name, "-F", "all"],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE
+            )
+            logger.debug("pf anchor {0} flushed".format(anchor_name))
             os.remove(backupfile)
-            logger.debug("iptables.backup removed")
+            logger.debug("pf_killswitch.backup removed")
         else:
-            logger.debug("No Backupfile found")
+            logger.debug("No pf backup found")
         return
 
-    # Stop if Kill Switch is disabled
+    # Stop if Kill Switch is disabled in config
     if not int(get_config_value("USER", "killswitch")):
         return
 
     if mode == "enable":
-        if os.path.isfile(backupfile):
-            logger.debug("Kill Switch backup exists")
-            manage_killswitch("restore")
+        logger.debug("Enabling Kill Switch via pf")
 
+        # Determine the VPN tun device from the openvpn log
         with open(os.path.join(CONFIG_DIR, "ovpn.log"), "r") as f:
             content = f.read()
-            device = re.search(r"(TUN\/TAP device) (.+) opened", content)
-            if not device:
-                print("[!] Kill Switch activation failed."
-                      "Device couldn't be determined.")
-                logger.debug(
-                    "Kill Switch activation failed. No device in logfile"
-                )
-            device = device.group(2)
+        device_match = re.search(r"(TUN\/TAP device) (.+) opened", content)
+        if not device_match:
+            print("[!] Kill Switch activation failed. "
+                  "VPN device couldn't be determined.")
+            logger.debug("Kill Switch failed: no device in ovpn.log")
+            return
+        vpn_device = device_match.group(2)
+        logger.debug("VPN device for Kill Switch: {0}".format(vpn_device))
 
-        # Backing up IPTables rules
-        logger.debug("Backing up iptables rules")
-        iptables_rules = subprocess.run(["iptables-save"],
-                                        stdout=subprocess.PIPE)
-
-        if "COMMIT" in iptables_rules.stdout.decode():
-            with open(backupfile, "wb") as f:
-                f.write(iptables_rules.stdout)
-        else:
-            with open(backupfile, "w") as f:
-                f.write("*filter\n")
-                f.write(":INPUT ACCEPT\n")
-                f.write(":FORWARD ACCEPT\n")
-                f.write(":OUTPUT ACCEPT\n")
-                f.write("COMMIT\n")
-
-        # Creating Kill Switch rules
-        iptables_commands = [
-            "iptables -F",
-            "iptables -P INPUT DROP",
-            "iptables -P OUTPUT DROP",
-            "iptables -P FORWARD DROP",
-            "iptables -A OUTPUT -o lo -j ACCEPT",
-            "iptables -A INPUT -i lo -j ACCEPT",
-            "iptables -A OUTPUT -o {0} -j ACCEPT".format(device),
-            "iptables -A INPUT -i {0} -j ACCEPT".format(device),
-            "iptables -A OUTPUT -o {0} -m state --state ESTABLISHED,RELATED -j ACCEPT".format(device), # noqa
-            "iptables -A INPUT -i {0} -m state --state ESTABLISHED,RELATED -j ACCEPT".format(device), # noqa
-            "iptables -A OUTPUT -p {0} -m {1} --dport {2} -j ACCEPT".format(proto.lower(), proto.lower(), port), # noqa
-            "iptables -A INPUT -p {0} -m {1} --sport {2} -j ACCEPT".format(proto.lower(), proto.lower(), port), # noqa
-        ]
-
-        if int(get_config_value("USER", "killswitch")) == 2:
-            # Getting local network information
+        try:
             default_nic = get_default_nic()
-            local_network = subprocess.run(
-                "ip addr show {0} | grep inet".format(default_nic),
-                stdout=subprocess.PIPE, shell=True
+        except RuntimeError:
+            print("[!] Kill Switch activation failed. "
+                  "Could not determine default NIC.")
+            return
+
+        # Build pf rules for the anchor
+        # Allow loopback, VPN tunnel, and the one UDP/TCP port used by openvpn.
+        # Block everything else on the physical NIC.
+        allow_lan = ""
+        if int(get_config_value("USER", "killswitch")) == 2:
+            # Determine LAN subnet
+            lan_info = subprocess.run(
+                ["ifconfig", default_nic],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE
             )
-            local_network = local_network.stdout.decode().strip().split()[1]
+            lan_cidr = None
+            for line in lan_info.stdout.decode().splitlines():
+                line = line.strip()
+                if line.startswith("inet "):
+                    parts = line.split()
+                    # parts: inet <ip> netmask <hex_mask> broadcast <bcast>
+                    try:
+                        ip_str = parts[1]
+                        # macOS reports netmask as hex (0xffffff00)
+                        hex_mask = parts[3]
+                        mask_int = int(hex_mask, 16)
+                        import ipaddress as _ipa
+                        ip_obj = _ipa.IPv4Interface(
+                            "{0}/{1}".format(ip_str, mask_int)
+                        )
+                        lan_cidr = str(ip_obj.network)
+                    except Exception:
+                        pass
+                    break
+            if lan_cidr:
+                allow_lan = (
+                    "pass out on {nic} to {net} keep state\n"
+                    "pass in  on {nic} from {net} keep state\n"
+                ).format(nic=default_nic, net=lan_cidr)
 
-            exclude_lan_commands = [
-                "iptables -A OUTPUT -o {0} -d {1} -j ACCEPT".format(default_nic, local_network), # noqa
-                "iptables -A INPUT -i {0} -s {1} -j ACCEPT".format(default_nic, local_network), # noqa
-            ]
+        pf_rules = (
+            "# ProtonVPN Kill Switch — managed by protonvpn-cli\n"
+            "# Allow loopback\n"
+            "pass quick on lo0 all\n"
+            "# Allow traffic on VPN tunnel\n"
+            "pass quick on {vpn} all\n"
+            "# Allow outgoing OpenVPN handshake on physical NIC\n"
+            "pass out quick on {nic} proto {proto} to any port {port} keep state\n"
+            "pass in  quick on {nic} proto {proto} from any port {port} keep state\n"
+            "{lan}"
+            "# Block everything else on physical NIC\n"
+            "block on {nic} all\n"
+        ).format(
+            vpn=vpn_device,
+            nic=default_nic,
+            proto=proto.lower(),
+            port=port,
+            lan=allow_lan
+        )
 
-            for lan_command in exclude_lan_commands:
-                iptables_commands.append(lan_command)
+        # Write pf anchor rules to a temp file and load them
+        pf_rules_file = os.path.join(CONFIG_DIR, "pf_killswitch.rules")
+        with open(pf_rules_file, "w") as f:
+            f.write(pf_rules)
 
-        for command in iptables_commands:
-            command = command.split()
-            subprocess.run(command)
-        logger.debug("Kill Switch enabled")
+        # Mark backup so restore knows the switch is active
+        with open(backupfile, "w") as f:
+            f.write(vpn_device + "\n")
+
+        # Load rules into anchor
+        load = subprocess.run(
+            ["pfctl", "-a", anchor_name, "-f", pf_rules_file],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE
+        )
+        if load.returncode != 0:
+            print("[!] Failed to load pf kill switch rules.")
+            logger.debug("pfctl load error: {0}".format(load.stderr.decode()))
+            os.remove(backupfile)
+        else:
+            # Enable pf if not already enabled
+            subprocess.run(
+                ["pfctl", "-e"],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE
+            )
+            logger.debug("Kill Switch enabled via pf anchor")
