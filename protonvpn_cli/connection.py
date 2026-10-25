@@ -19,7 +19,8 @@ from .utils import (
     set_config_value, get_ip_info, get_country_name,
     get_fastest_server, check_update, get_default_nic,
     get_transferred_data, create_openvpn_config,
-    is_ipv6_disabled, patch_passfile
+    is_ipv6_disabled, patch_passfile, get_gateway,
+    get_split_tunnel_ips
 )
 # Constants
 from .constants import (
@@ -335,6 +336,7 @@ def disconnect(passed=False):
             manage_dns("restore")
             manage_ipv6("restore")
             manage_killswitch("restore")
+            manage_split_tunnel("remove")
             logger.debug("Disconnected")
             if not passed:
                 print("Disconnected.")
@@ -344,6 +346,7 @@ def disconnect(passed=False):
         manage_dns("restore")
         manage_ipv6("restore")
         manage_killswitch("restore")
+        manage_split_tunnel("remove")
         logger.debug("No connection found")
 
 
@@ -455,6 +458,15 @@ def openvpn_connect(servername, protocol):
 
     disconnect(passed=True)
 
+    # Save the pre-VPN default gateway so split tunnel routes can use it
+    try:
+        pre_vpn_gateway = get_gateway()
+        set_config_value("metadata", "pre_vpn_gateway", pre_vpn_gateway)
+        logger.debug("Pre-VPN gateway saved: {0}".format(pre_vpn_gateway))
+    except RuntimeError:
+        pre_vpn_gateway = None
+        logger.debug("Could not determine pre-VPN gateway")
+
     old_ip, _ = get_ip_info()
 
     print("Connecting to {0} via {1}...".format(servername, protocol.upper()))
@@ -501,6 +513,13 @@ def openvpn_connect(servername, protocol):
                 manage_ipv6("disable")
                 manage_killswitch("enable", proto=protocol.lower(),
                                   port=port[protocol.lower()])
+
+                # Apply split tunneling routes via the pre-VPN gateway
+                if pre_vpn_gateway:
+                    manage_split_tunnel("apply", gateway=pre_vpn_gateway)
+                else:
+                    logger.debug("Skipping split tunnel: no pre-VPN gateway")
+
                 new_ip, _ = get_ip_info()
                 if old_ip == new_ip:
                     logger.debug("Failed to connect. IP didn't change")
@@ -885,3 +904,103 @@ def manage_killswitch(mode, proto=None, port=None):
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE
             )
             logger.debug("Kill Switch enabled via pf anchor")
+
+
+def manage_split_tunnel(mode, gateway=None):
+    """
+    Manage split tunneling routes on macOS using the system `route` command.
+
+    Split tunneling routes bypass the VPN and go directly through the
+    original default gateway. This is applied AFTER OpenVPN connects so
+    that we have a real gateway address to point routes at.
+
+    Modes:
+      apply   – Add bypass routes for all IPs in split_tunnel.txt.
+      remove  – Delete previously added bypass routes.
+      add     – Add a single bypass route (gateway=(ip, netmask, gw)).
+      delete  – Delete a single bypass route (gateway=(ip, netmask)).
+    """
+
+    try:
+        split_enabled = int(get_config_value("USER", "split_tunnel"))
+    except KeyError:
+        split_enabled = 0
+
+    if mode in ("apply", "remove") and not split_enabled:
+        logger.debug("Split tunneling disabled, skipping")
+        return
+
+    ips = get_split_tunnel_ips()
+
+    def _route_add(ip, netmask, gw):
+        if netmask == "255.255.255.255":
+            cmd = ["route", "add", "-host", ip, gw]
+        else:
+            cmd = ["route", "add", "-net", ip, "-netmask", netmask, gw]
+        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        err = res.stderr.decode().strip()
+        if res.returncode == 0 or "File exists" in err:
+            return True, err
+        return False, err
+
+    def _route_del(ip, netmask):
+        if netmask == "255.255.255.255":
+            cmd = ["route", "delete", "-host", ip]
+        else:
+            cmd = ["route", "delete", "-net", ip, "-netmask", netmask]
+        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        err = res.stderr.decode().strip()
+        if res.returncode == 0 or "not in table" in err or "No such process" in err:
+            return True, err
+        return False, err
+
+    if mode == "apply":
+        if not gateway:
+            logger.debug("No gateway provided for split tunnel apply")
+            return
+        if not ips:
+            logger.debug("Split tunnel file is empty, nothing to route")
+            return
+
+        logger.debug("Applying split tunnel routes via gateway {0}".format(gateway))
+        for ip, netmask, original in ips:
+            ok, err = _route_add(ip, netmask, gateway)
+            if ok:
+                logger.debug("Split route added/verified: {0}/{1} via {2}".format(
+                    ip, netmask, gateway))
+            else:
+                logger.debug("Failed to add route {0}: {1}".format(original, err))
+
+    elif mode == "remove":
+        logger.debug("Removing split tunnel routes")
+        for ip, netmask, original in ips:
+            ok, err = _route_del(ip, netmask)
+            if ok:
+                logger.debug("Split route removed: {0}".format(original))
+            else:
+                logger.debug("Route delete note for {0}: {1}".format(original, err))
+
+    elif mode == "add":
+        if not gateway or len(gateway) != 3:
+            raise ValueError("mode='add' requires gateway=(ip, netmask, gw)")
+        ip, netmask, gw = gateway
+        ok, err = _route_add(ip, netmask, gw)
+        if not ok:
+            print("[!] Failed to add route: {0}".format(err))
+            logger.debug("route add failed: {0}".format(err))
+        else:
+            logger.debug("Dynamic split route added: {0}/{1} via {2}".format(ip, netmask, gw))
+
+    elif mode == "delete":
+        if not gateway or len(gateway) < 2:
+            raise ValueError("mode='delete' requires gateway=(ip, netmask)")
+        ip, netmask = gateway[0], gateway[1]
+        ok, err = _route_del(ip, netmask)
+        if not ok:
+            print("[!] Failed to delete route: {0}".format(err))
+            logger.debug("route delete failed: {0}".format(err))
+        else:
+            logger.debug("Dynamic split route deleted: {0}/{1}".format(ip, netmask))
+
+    else:
+        raise ValueError("Invalid mode. Must be: apply, remove, add, delete")

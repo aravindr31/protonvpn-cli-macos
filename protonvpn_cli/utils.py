@@ -188,6 +188,19 @@ def get_default_nic():
     raise RuntimeError("Could not determine default network interface")
 
 
+def get_gateway():
+    """Find and return the default gateway IP (macOS-compatible)."""
+    result = subprocess.run(
+        ["netstat", "-rn", "-f", "inet"],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE
+    )
+    for line in result.stdout.decode().splitlines():
+        parts = line.split()
+        if parts and parts[0] == "default":
+            return parts[1]  # Gateway IP is the second column
+    raise RuntimeError("Could not determine default gateway")
+
+
 def is_connected():
     """Check if a VPN connection already exists."""
     ovpn_processes = subprocess.run(["pgrep", "-x", "openvpn"],
@@ -552,6 +565,28 @@ def get_transferred_data():
         return '-', '-'
 
     return convert_size(tx_bytes), convert_size(rx_bytes)
+
+
+def get_split_tunnel_ips():
+    """Return a list of (ip, netmask, original) tuples from the split tunnel file.
+    Skips blank lines and invalid entries."""
+    if not os.path.isfile(SPLIT_TUNNEL_FILE):
+        return []
+
+    entries = []
+    with open(SPLIT_TUNNEL_FILE, "r") as f:
+        for line in f:
+            line = line.strip()
+            if not line or not is_valid_ip(line):
+                continue
+            if "/" in line:
+                ip, cidr = line.split("/")
+                netmask = cidr_to_netmask(int(cidr))
+            else:
+                ip = line
+                netmask = "255.255.255.255"
+            entries.append((ip, netmask, line))  # (ip, netmask, original cidr-or-host)
+    return entries
 
 
 def patch_passfile(passfile):

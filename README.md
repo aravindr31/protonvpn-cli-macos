@@ -77,6 +77,10 @@ sudo python3 setup.py install
 |`protonvpn reconnect, r`           | Reconnect or connect to the last server used.         |
 |`protonvpn disconnect, d`          | Disconnect the current session.                       |
 |`protonvpn status, s`              | Print connection status.                              |
+|`protonvpn split-tunnel list`      | List IPs/CIDRs excluded from VPN (bypass routes).     |
+|`protonvpn split-tunnel add <ip>`  | Add an IP/CIDR to bypass the VPN.                     |
+|`protonvpn split-tunnel remove <ip>`| Remove an IP/CIDR from the bypass list.              |
+|`protonvpn split-tunnel clear`     | Remove all bypass entries and disable split tunneling.|
 |`protonvpn configure`              | Change CLI configuration.                             |
 |`protonvpn refresh`                | Refresh OpenVPN configuration and server data.        |
 |`protonvpn examples`               | Print example commands.                               |
