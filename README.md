@@ -49,15 +49,15 @@ brew install openvpn dialog python3
 3. Install
 
     ```bash
-    pip3 install -r requirements.txt
-    sudo python3 setup.py install
+    pip3 install --break-system-packages -r requirements.txt
+    sudo pip3 install --break-system-packages .
     ```
 
 For updating, pull the latest version:
 
 ```bash
 git pull
-sudo python3 setup.py install
+sudo pip3 install --break-system-packages .
 ```
 
 ### How to use

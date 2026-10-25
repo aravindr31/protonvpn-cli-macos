@@ -38,6 +38,7 @@ setup(
         "protonvpn_cli": ["templates/*"]
     },
     install_requires=[
+        "setuptools",
         "requests",
         "docopt",
         "pythondialog",

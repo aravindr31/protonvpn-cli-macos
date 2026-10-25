@@ -231,3 +231,4 @@ if __name__ == "__main__":
         p = int(sys.argv[3]) if len(sys.argv) > 3 else 1080
         lf = sys.argv[4] if len(sys.argv) > 4 else None
         run_proxy_server(iface, host="127.0.0.1", port=p, dns_server=dns, log_file=lf)
+
