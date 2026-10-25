@@ -1,4 +1,5 @@
 # Call with pip install -r requirements.txt
+setuptools
 docopt
 requests
 pythondialog

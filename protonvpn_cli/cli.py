@@ -3,19 +3,24 @@ A CLI for ProtonVPN.
 
 Usage:
     protonvpn init
-    protonvpn (c | connect) [<servername>] [-p <protocol>]
-    protonvpn (c | connect) [-f | --fastest] [-p <protocol>]
-    protonvpn (c | connect) [--cc <code>] [-p <protocol>]
-    protonvpn (c | connect) [--sc] [-p <protocol>]
-    protonvpn (c | connect) [--p2p] [-p <protocol>]
-    protonvpn (c | connect) [--tor] [-p <protocol>]
-    protonvpn (c | connect) [-r | --random] [-p <protocol>]
+    protonvpn (c | connect) [<servername>] [-p <protocol>] [--proxy-only]
+    protonvpn (c | connect) [-f | --fastest] [-p <protocol>] [--proxy-only]
+    protonvpn (c | connect) [--cc <code>] [-p <protocol>] [--proxy-only]
+    protonvpn (c | connect) [--sc] [-p <protocol>] [--proxy-only]
+    protonvpn (c | connect) [--p2p] [-p <protocol>] [--proxy-only]
+    protonvpn (c | connect) [--tor] [-p <protocol>] [--proxy-only]
+    protonvpn (c | connect) [-r | --random] [-p <protocol>] [--proxy-only]
     protonvpn (r | reconnect)
     protonvpn (d | disconnect)
     protonvpn (s | status)
     protonvpn configure
     protonvpn refresh
     protonvpn examples
+    protonvpn app-routing
+    protonvpn split-tunnel list
+    protonvpn split-tunnel add <ip>
+    protonvpn split-tunnel remove <ip>
+    protonvpn split-tunnel clear
     protonvpn (-h | --help)
     protonvpn (-v | --version)
 
@@ -27,6 +32,9 @@ Options:
     --p2p               Connect to the fastest torrent server.
     --tor               Connect to the fastest Tor server.
     -p PROTOCOL         Determine the protocol (UDP or TCP).
+    --proxy-only        App Proxy mode: start SOCKS5 proxy on 127.0.0.1:1080
+                        and route only configured apps (e.g. Firefox),
+                        leaving normal system network traffic untouched.
     -h, --help          Show this help message.
     -v, --version       Display version.
 
@@ -39,9 +47,16 @@ Commands:
     configure           Change ProtonVPN-CLI configuration.
     refresh             Refresh OpenVPN configuration and server data.
     examples            Print some example commands.
+    app-routing         Print guide on routing Firefox through the VPN.
+    split-tunnel        Manage split tunneling rules.
+      list              Show all IPs/CIDRs excluded from VPN.
+      add <ip>          Add an IP or CIDR to exclude from VPN.
+      remove <ip>       Remove an IP or CIDR from the exclusion list.
+      clear             Remove all split tunnel entries.
 
 Arguments:
     <servername>        Servername (CH#4, CH-US-1, HK5-Tor).
+    <ip>                IP address or CIDR (e.g. 192.168.1.0/24).
 """
 # Standard Libraries
 import sys
@@ -59,7 +74,8 @@ from .logger import logger
 from .utils import (
     check_root, change_file_owner, pull_server_data,
     check_init, set_config_value, get_config_value,
-    is_valid_ip, wait_for_network
+    is_valid_ip, wait_for_network, get_split_tunnel_ips,
+    is_connected, get_gateway
 )
 # Constants
 from .constants import (
@@ -106,27 +122,28 @@ def cli():
         if int(os.environ.get("PVPN_WAIT", 0)) > 0:
             wait_for_network(int(os.environ["PVPN_WAIT"]))
 
+        proxy_only = bool(args.get("--proxy-only"))
         protocol = args.get("-p")
         if protocol is not None and protocol.lower().strip() in ["tcp", "udp"]:
             protocol = protocol.lower().strip()
 
         if args.get("--random"):
-            connection.random_c(protocol)
+            connection.random_c(protocol, proxy_only=proxy_only)
         elif args.get("--fastest"):
-            connection.fastest(protocol)
+            connection.fastest(protocol, proxy_only=proxy_only)
         elif args.get("<servername>"):
-            connection.direct(args.get("<servername>"), protocol)
+            connection.direct(args.get("<servername>"), protocol, proxy_only=proxy_only)
         elif args.get("--cc") is not None:
-            connection.country_f(args.get("--cc"), protocol)
+            connection.country_f(args.get("--cc"), protocol, proxy_only=proxy_only)
         # Features: 1: Secure-Core, 2: Tor, 4: P2P
         elif args.get("--p2p"):
-            connection.feature_f(4, protocol)
+            connection.feature_f(4, protocol, proxy_only=proxy_only)
         elif args.get("--sc"):
-            connection.feature_f(1, protocol)
+            connection.feature_f(1, protocol, proxy_only=proxy_only)
         elif args.get("--tor"):
-            connection.feature_f(2, protocol)
+            connection.feature_f(2, protocol, proxy_only=proxy_only)
         else:
-            connection.dialog()
+            connection.dialog(proxy_only=proxy_only)
     elif args.get("r") or args.get("reconnect"):
         check_root()
         check_init()
@@ -146,6 +163,19 @@ def cli():
         pull_server_data(force=True)
     elif args.get("examples"):
         print_examples()
+    elif args.get("app-routing"):
+        print_app_routing_guide()
+    elif args.get("split-tunnel"):
+        check_root()
+        check_init()
+        if args.get("list"):
+            split_tunnel_list()
+        elif args.get("add"):
+            split_tunnel_add(args.get("<ip>"))
+        elif args.get("remove"):
+            split_tunnel_remove(args.get("<ip>"))
+        elif args.get("clear"):
+            split_tunnel_clear()
 
 
 def init_cli():
@@ -655,3 +685,222 @@ def set_split_tunnel():
 
     print()
     print("Split tunneling configuration updated.")
+
+
+# ---------------------------------------------------------------------------
+# Split Tunneling management functions
+# ---------------------------------------------------------------------------
+
+def split_tunnel_list():
+    """List all IPs/CIDRs currently excluded from the VPN tunnel."""
+    entries = get_split_tunnel_ips()
+    enabled = get_config_value("USER", "split_tunnel") == "1"
+
+    status = "enabled" if enabled else "disabled"
+    print("Split tunneling: {0}".format(status))
+    print()
+
+    if not entries:
+        print("No IPs/CIDRs configured for split tunneling.")
+        print("Add one with: protonvpn split-tunnel add <ip/cidr>")
+        return
+
+    print("{0:<22} {1}".format("IP / CIDR", "Netmask"))
+    print("-" * 42)
+    for ip, netmask, original in entries:
+        print("{0:<22} {1}".format(original, netmask))
+
+    print()
+    if is_connected() and enabled:
+        try:
+            gw = get_config_value("metadata", "pre_vpn_gateway")
+            print("Active gateway for bypass: {0}".format(gw))
+        except KeyError:
+            pass
+
+
+def split_tunnel_add(ip_input):
+    """Add an IP or CIDR to the split tunnel exclusion list.
+
+    If the VPN is currently connected, also applies the route live.
+    """
+    if not ip_input:
+        print("[!] No IP provided.")
+        sys.exit(1)
+
+    ip_input = ip_input.strip()
+
+    if not is_valid_ip(ip_input):
+        print("[!] '{0}' is not a valid IP address or CIDR.".format(ip_input))
+        sys.exit(1)
+
+    # Check for duplicates
+    existing = [orig for _, _, orig in get_split_tunnel_ips()]
+    if ip_input in existing:
+        print("[!] '{0}' is already in the split tunnel list.".format(ip_input))
+        return
+
+    # Disable kill switch if active (incompatible)
+    try:
+        if int(get_config_value("USER", "killswitch")):
+            print(
+                "[!] Kill Switch is enabled — split tunneling cannot be used with Kill Switch.\n"
+                "[!] Disable Kill Switch first via: protonvpn configure"
+            )
+            sys.exit(1)
+    except KeyError:
+        pass
+
+    # Enable split tunnel flag
+    set_config_value("USER", "split_tunnel", 1)
+
+    # Append to file
+    with open(SPLIT_TUNNEL_FILE, "a") as f:
+        f.write("\n{0}".format(ip_input))
+    change_file_owner(SPLIT_TUNNEL_FILE)
+
+    print("Added '{0}' to split tunnel list.".format(ip_input))
+
+    # If currently connected, apply the route live
+    if is_connected():
+        try:
+            gw = get_config_value("metadata", "pre_vpn_gateway")
+        except KeyError:
+            print("[!] No saved gateway — reconnect to activate this route.")
+            return
+
+        import ipaddress as _ipa
+        if "/" in ip_input:
+            ip_str, cidr = ip_input.split("/")
+            net = _ipa.IPv4Network(ip_input, strict=False)
+            netmask = str(net.netmask)
+        else:
+            ip_str = ip_input
+            netmask = "255.255.255.255"
+
+        connection.manage_split_tunnel("add", gateway=(ip_str, netmask, gw))
+        print("Route applied live: {0} via {1}".format(ip_input, gw))
+    else:
+        print("Route will take effect on next connection.")
+
+
+def split_tunnel_remove(ip_input):
+    """Remove an IP or CIDR from the split tunnel list.
+
+    If the VPN is currently connected, also removes the route live.
+    """
+    if not ip_input:
+        print("[!] No IP provided.")
+        sys.exit(1)
+
+    ip_input = ip_input.strip()
+
+    entries = get_split_tunnel_ips()
+    originals = [orig for _, _, orig in entries]
+
+    if ip_input not in originals:
+        print("[!] '{0}' is not in the split tunnel list.".format(ip_input))
+        sys.exit(1)
+
+    # Rewrite file without the target entry
+    with open(SPLIT_TUNNEL_FILE, "w") as f:
+        for _, _, orig in entries:
+            if orig != ip_input:
+                f.write("{0}\n".format(orig))
+
+    # If file is now empty, disable split tunnel flag
+    remaining = get_split_tunnel_ips()
+    if not remaining:
+        set_config_value("USER", "split_tunnel", 0)
+        print("Split tunneling disabled (no entries remaining).")
+
+    print("Removed '{0}' from split tunnel list.".format(ip_input))
+
+    # If currently connected, remove the route live
+    if is_connected():
+        import ipaddress as _ipa
+        if "/" in ip_input:
+            ip_str, cidr = ip_input.split("/")
+            net = _ipa.IPv4Network(ip_input, strict=False)
+            netmask = str(net.netmask)
+        else:
+            ip_str = ip_input
+            netmask = "255.255.255.255"
+
+        connection.manage_split_tunnel("delete", gateway=(ip_str, netmask))
+        print("Route removed live.")
+    else:
+        print("Route will be removed on next connection.")
+
+
+def split_tunnel_clear():
+    """Remove all split tunnel entries and disable split tunneling."""
+    entries = get_split_tunnel_ips()
+
+    if not entries:
+        print("Split tunnel list is already empty.")
+        set_config_value("USER", "split_tunnel", 0)
+        return
+
+    confirm = input(
+        "Remove all {0} split tunnel entries? [y/N]: ".format(len(entries))
+    ).strip().lower()
+
+    if confirm != "y":
+        print("Cancelled.")
+        return
+
+    # Remove live routes if connected
+    if is_connected():
+        connection.manage_split_tunnel("remove")
+        print("Live routes removed.")
+
+    # Wipe the file and disable flag
+    if os.path.isfile(SPLIT_TUNNEL_FILE):
+        os.remove(SPLIT_TUNNEL_FILE)
+
+    set_config_value("USER", "split_tunnel", 0)
+    print("Split tunnel list cleared and split tunneling disabled.")
+
+
+def print_app_routing_guide():
+    """Print guide on routing Firefox or other apps through the VPN proxy."""
+    guide = (
+        "\n"
+        "======================================================================\n"
+        "           HOW TO ROUTE FIREFOX (ONLY) THROUGH PROTONVPN              \n"
+        "======================================================================\n"
+        "\n"
+        "In App Proxy mode, your Mac's default network route is UNTOUCHED.\n"
+        "All your normal applications (Safari, Zoom, Slack, Terminal, etc.)\n"
+        "continue using your normal Wi-Fi / home network.\n"
+        "\n"
+        "Only the applications you configure for SOCKS5 proxy will route\n"
+        "their traffic and DNS through ProtonVPN.\n"
+        "\n"
+        "--- STEP 1: Connect in App Proxy mode ---\n"
+        "  sudo protonvpn c -f --proxy-only\n"
+        "\n"
+        "--- STEP 2: Configure Firefox ---\n"
+        "  1. Open Firefox.\n"
+        "  2. Press Cmd + , (or go to Settings / Preferences).\n"
+        "  3. In the search box, type 'network' or scroll to 'Network Settings'.\n"
+        "  4. Click the 'Settings...' button.\n"
+        "  5. Choose 'Manual proxy configuration':\n"
+        "       SOCKS Host: 127.0.0.1\n"
+        "       Port:       1080\n"
+        "       Version:    Select 'SOCKS v5'\n"
+        "  6. [CRITICAL] Check the box:\n"
+        "       ☑ 'Proxy DNS when using SOCKS v5'\n"
+        "       (This forces all domain lookups through ProtonVPN to prevent DNS leaks)\n"
+        "  7. Click 'OK'.\n"
+        "\n"
+        "--- STEP 3: Verify ---\n"
+        "  Visit https://ipinfo.io in Firefox -> Shows ProtonVPN's IP and ISP.\n"
+        "  Visit https://ipinfo.io in Safari  -> Shows your normal home IP and ISP.\n"
+        "\n"
+        "--- STEP 4: Disconnect when done ---\n"
+        "  sudo protonvpn disconnect\n"
+        "======================================================================\n"
+    )
+    print(guide)

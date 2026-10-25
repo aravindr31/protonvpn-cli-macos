@@ -175,15 +175,30 @@ def get_fastest_server(server_pool):
 
 
 def get_default_nic():
-    """Find and return the default network interface"""
+    """Find and return the default network interface (macOS-compatible)."""
     default_route = subprocess.run(
-        "netstat -an | grep default | awk '{print $NF}'",
-        stdout=subprocess.PIPE, shell=True
+        ["netstat", "-rn", "-f", "inet"],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE
     )
+    for line in default_route.stdout.decode().splitlines():
+        parts = line.split()
+        if parts and parts[0] == "default":
+            # The interface is the last column on macOS netstat output
+            return parts[-1]
+    raise RuntimeError("Could not determine default network interface")
 
-    # Get the default nic from netstat output
-    default_nic = default_route.stdout.decode().strip().split()[4]
-    return default_nic
+
+def get_gateway():
+    """Find and return the default gateway IP (macOS-compatible)."""
+    result = subprocess.run(
+        ["netstat", "-rn", "-f", "inet"],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE
+    )
+    for line in result.stdout.decode().splitlines():
+        parts = line.split()
+        if parts and parts[0] == "default":
+            return parts[1]  # Gateway IP is the second column
+    raise RuntimeError("Could not determine default gateway")
 
 
 def is_connected():
@@ -200,14 +215,24 @@ def is_connected():
 
 
 def is_ipv6_disabled():
-    """Returns True if IPv6 is disabled and False if it's enabled"""
-    ipv6_state = subprocess.run(['sysctl', '-n', 'net.ipv6.conf.all.disable_ipv6'],
-                                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-
-    if ipv6_state.returncode != 0 or int(ipv6_state.stdout):
+    """Returns True if IPv6 is disabled and False if it's enabled (macOS-compatible)."""
+    # On macOS, check via ifconfig for any inet6 global addresses on the default NIC
+    try:
+        default_nic = get_default_nic()
+    except RuntimeError:
         return True
-    else:
-        return False
+
+    result = subprocess.run(
+        ["ifconfig", default_nic],
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
+    )
+    output = result.stdout.decode()
+    # If there's a non-link-local inet6 address, IPv6 is active
+    for line in output.splitlines():
+        line = line.strip()
+        if line.startswith("inet6") and "fe80::" not in line:
+            return False
+    return True
 
 
 def wait_for_network(wait_time):
@@ -256,12 +281,13 @@ def render_j2_template(template_file, destination_file, values):
     change_file_owner(destination_file)
 
 
-def create_openvpn_config(serverlist, protocol, ports):
+def create_openvpn_config(serverlist, protocol, ports, proxy_only=False):
     """
     Create the OpenVPN Config file
     serverlist = list with IPs or hostnames
     protocol = "udp" or "tcp"
     ports = list with possible ports
+    proxy_only = boolean, if True do not redirect default gateway
     """
 
     # Split Tunneling
@@ -302,7 +328,8 @@ def create_openvpn_config(serverlist, protocol, ports):
         "openvpn_ports": ports,
         "split": split,
         "ip_nm_pairs": ip_nm_pairs,
-        "ipv6_disabled": ipv6_disabled
+        "ipv6_disabled": ipv6_disabled,
+        "proxy_only": proxy_only
     }
 
     render_j2_template(template_file="openvpn_template.j2", destination_file=OVPN_FILE, values=j2_values)
@@ -310,19 +337,24 @@ def create_openvpn_config(serverlist, protocol, ports):
 
 def change_file_owner(path):
     """Change the owner of specific files to the sudo user."""
-    uid = int(subprocess.run(["id", "-u", USER],
-                             stdout=subprocess.PIPE).stdout)
-    gid = int(subprocess.run(["id", "-u", USER],
-                             stdout=subprocess.PIPE).stdout)
+    if not os.path.exists(path):
+        return
+    try:
+        uid = int(subprocess.run(["id", "-u", USER],
+                                 stdout=subprocess.PIPE).stdout)
+        gid = int(subprocess.run(["id", "-u", USER],
+                                 stdout=subprocess.PIPE).stdout)
 
-    current_owner = subprocess.run(["id", "-nu", str(os.stat(path).st_uid)],
-                                   stdout=subprocess.PIPE).stdout
-    current_owner = current_owner.decode().rstrip("\n")
+        current_owner = subprocess.run(["id", "-nu", str(os.stat(path).st_uid)],
+                                       stdout=subprocess.PIPE).stdout
+        current_owner = current_owner.decode().rstrip("\n")
 
-    # Only change file owner if it wasn't owned by current running user.
-    if current_owner != USER:
-        os.chown(path, uid, gid)
-        logger.debug("Changed owner of {0} to {1}".format(path, USER))
+        # Only change file owner if it wasn't owned by current running user.
+        if current_owner != USER:
+            os.chown(path, uid, gid)
+            logger.debug("Changed owner of {0} to {1}".format(path, USER))
+    except Exception as e:
+        logger.debug("change_file_owner failed for {0}: {1}".format(path, e))
 
 
 def check_root():
@@ -336,7 +368,7 @@ def check_root():
         sys.exit(1)
     else:
         # Check for dependencies
-        dependencies = ["openvpn", "netstat", "sysctl", "pgrep", "pkill"]
+        dependencies = ["openvpn", "netstat", "pgrep", "pkill", "pfctl", "networksetup"]
         for program in dependencies:
             check = subprocess.run(["which", program],
                                    stdout=subprocess.PIPE,
@@ -489,8 +521,9 @@ def is_valid_ip(ipaddr):
 
 
 def get_transferred_data():
-    """Reads and returns the amount of data transferred during a session
-    from the /sys/ directory"""
+    """Reads and returns the amount of data transferred during a session.
+    Uses ifconfig on macOS (no /sys/class/net).
+    """
 
     def convert_size(size_bytes):
         """Converts byte amounts into human readable formats"""
@@ -503,24 +536,64 @@ def get_transferred_data():
         s = round(size_bytes / p, 2)
         return "{0} {1}".format(s, size_name[i])
 
-    base_path = "/sys/class/net/{0}/statistics/{1}"
+    # Try to find the VPN tun interface (proton0 or tun0)
+    adapter_name = None
+    for candidate in ("proton0", "tun0"):
+        check = subprocess.run(
+            ["ifconfig", candidate],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
+        )
+        if check.returncode == 0:
+            adapter_name = candidate
+            break
 
-    if os.path.isfile(base_path.format('proton0', 'rx_bytes')):
-        adapter_name = 'proton0'
-    elif os.path.isfile(base_path.format('tun0', 'rx_bytes')):
-        adapter_name = 'tun0'
-    else:
+    if adapter_name is None:
         logger.debug("No usage stats for VPN interface available")
         return '-', '-'
 
-    # Get transmitted and received bytes from /sys/ directory
-    with open(base_path.format(adapter_name, 'tx_bytes'), "r") as f:
-        tx_bytes = int(f.read())
+    # Parse netstat -I <iface> for bytes in/out
+    result = subprocess.run(
+        ["netstat", "-I", adapter_name, "-b"],
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
+    )
+    lines = result.stdout.decode().splitlines()
+    if len(lines) < 2:
+        logger.debug("netstat output too short for interface {0}".format(adapter_name))
+        return '-', '-'
 
-    with open(base_path.format(adapter_name, 'rx_bytes'), "r") as f:
-        rx_bytes = int(f.read())
+    # Header line: Name Mtu Network Address Ipkts Ierrs Ibytes Opkts Oerrs Obytes Drop
+    # Data  line: proton0 ...
+    try:
+        parts = lines[1].split()
+        rx_bytes = int(parts[6])   # Ibytes column
+        tx_bytes = int(parts[9])   # Obytes column
+    except (IndexError, ValueError):
+        logger.debug("Could not parse netstat output for {0}".format(adapter_name))
+        return '-', '-'
 
     return convert_size(tx_bytes), convert_size(rx_bytes)
+
+
+def get_split_tunnel_ips():
+    """Return a list of (ip, netmask, original) tuples from the split tunnel file.
+    Skips blank lines and invalid entries."""
+    if not os.path.isfile(SPLIT_TUNNEL_FILE):
+        return []
+
+    entries = []
+    with open(SPLIT_TUNNEL_FILE, "r") as f:
+        for line in f:
+            line = line.strip()
+            if not line or not is_valid_ip(line):
+                continue
+            if "/" in line:
+                ip, cidr = line.split("/")
+                netmask = cidr_to_netmask(int(cidr))
+            else:
+                ip = line
+                netmask = "255.255.255.255"
+            entries.append((ip, netmask, line))  # (ip, netmask, original cidr-or-host)
+    return entries
 
 
 def patch_passfile(passfile):
